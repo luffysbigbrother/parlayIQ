@@ -242,6 +242,24 @@ select option{background:var(--ink2)}
 .ts-ok{color:var(--fg2)}
 .ts-warn{color:var(--amber-l)}
 .ts-building{color:var(--fg3);font-style:italic}
+/* Split quality toggle */
+.sq-toggle{display:flex;gap:4px;padding:0 12px 8px}
+.sqb{flex:1;padding:4px 6px;border-radius:var(--r);border:0.5px solid var(--line);background:var(--ink3);color:var(--fg3);cursor:pointer;font-size:10px;font-weight:500;text-align:center;font-family:var(--font);transition:all .12s}
+.sqb:hover{border-color:var(--line2);color:var(--fg2)}
+.sqb.sq-active{background:var(--teal-x);border-color:rgba(8,145,178,.4);color:var(--teal-l)}
+/* Survival score */
+.survival{font-size:10px;font-family:var(--mono);color:var(--fg3);text-align:right}
+.survival-good{color:var(--green-l)}
+.survival-ok{color:var(--amber-l)}
+.survival-hard{color:var(--red-l)}
+/* Hedge leg indicator */
+.lp-hedge{opacity:.7;font-style:italic}
+/* Game type pills */
+.game-type-pill{font-size:9px;font-weight:700;padding:1px 7px;border-radius:99px;letter-spacing:.06em;border:1px solid;white-space:nowrap}
+.gtp-div {background:rgba(251,191,36,.12);color:var(--gold-l); border-color:rgba(202,138,4,.35)}
+.gtp-lgue{background:var(--blue-x);           color:var(--blue-l);border-color:rgba(37,99,235,.35)}
+.gtp-ilex{background:var(--purple-x);         color:var(--purple-l);border-color:rgba(124,58,237,.35)}
+.gtp-unknown{display:none}
 /* Recent context pills on game cards */
 .gc-context{display:flex;gap:4px;flex-wrap:wrap;padding:0 12px 8px}
 .ctx-pill{font-size:9px;font-weight:600;padding:1px 6px;border-radius:4px;border:1px solid}
@@ -372,29 +390,186 @@ let _seq = Date.now();
 const uid = (p = 'x') => `${p}-${_seq++}`;
 
 // ═══════════════════════════════════════════
-// TIER ENGINE
-// Single source of truth for what each tier means.
-// Maps tier key -> behaviour contract used by all modules.
+// MLB DIVISION MAP
+// Static — divisions don't change mid-season.
+// Used to classify each game as:
+//   DIV  = same division
+//   LGUE = same league, different division
+//   ILEX = inter-league
+// ═══════════════════════════════════════════
+const MLBMap = (() => {
+  const DIVISIONS = {
+    // AL East
+    'New York Yankees':    { league:'AL', division:'AL East' },
+    'Boston Red Sox':      { league:'AL', division:'AL East' },
+    'Toronto Blue Jays':   { league:'AL', division:'AL East' },
+    'Tampa Bay Rays':      { league:'AL', division:'AL East' },
+    'Baltimore Orioles':   { league:'AL', division:'AL East' },
+    // AL Central
+    'Chicago White Sox':   { league:'AL', division:'AL Central' },
+    'Cleveland Guardians': { league:'AL', division:'AL Central' },
+    'Detroit Tigers':      { league:'AL', division:'AL Central' },
+    'Kansas City Royals':  { league:'AL', division:'AL Central' },
+    'Minnesota Twins':     { league:'AL', division:'AL Central' },
+    // AL West
+    'Houston Astros':      { league:'AL', division:'AL West' },
+    'Los Angeles Angels':  { league:'AL', division:'AL West' },
+    'Oakland Athletics':   { league:'AL', division:'AL West' },
+    'Athletics':           { league:'AL', division:'AL West' },
+    'Seattle Mariners':    { league:'AL', division:'AL West' },
+    'Texas Rangers':       { league:'AL', division:'AL West' },
+    // NL East
+    'Atlanta Braves':      { league:'NL', division:'NL East' },
+    'Miami Marlins':       { league:'NL', division:'NL East' },
+    'New York Mets':       { league:'NL', division:'NL East' },
+    'Philadelphia Phillies':{ league:'NL', division:'NL East' },
+    'Washington Nationals':{ league:'NL', division:'NL East' },
+    // NL Central
+    'Chicago Cubs':        { league:'NL', division:'NL Central' },
+    'Cincinnati Reds':     { league:'NL', division:'NL Central' },
+    'Milwaukee Brewers':   { league:'NL', division:'NL Central' },
+    'Pittsburgh Pirates':  { league:'NL', division:'NL Central' },
+    'St. Louis Cardinals': { league:'NL', division:'NL Central' },
+    // NL West
+    'Arizona Diamondbacks':{ league:'NL', division:'NL West' },
+    'Colorado Rockies':    { league:'NL', division:'NL West' },
+    'Los Angeles Dodgers': { league:'NL', division:'NL West' },
+    'San Diego Padres':    { league:'NL', division:'NL West' },
+    'San Francisco Giants':{ league:'NL', division:'NL West' },
+  };
+
+  const classify = (awayTeam, homeTeam) => {
+    const away = DIVISIONS[awayTeam];
+    const home = DIVISIONS[homeTeam];
+    if (!away || !home) return { type:'unknown', label:'—', division:'' };
+    if (away.division === home.division)
+      return { type:'div',  label:'DIV',  division: away.division };
+    if (away.league === home.league)
+      return { type:'lgue', label:'LGUE', division: `${away.league}` };
+    return { type:'ilex', label:'ILEX', division: `${away.league} vs ${home.league}` };
+  };
+
+  const get = team => DIVISIONS[team] || null;
+
+  return { classify, get };
+})();
+
+// ═══════════════════════════════════════════
+// TIER ENGINE v2
+// Actuarially calibrated priors (Bühlmann credibility).
+// Kelly-derived slot allocations.
+// Dog/favorite differentiation on every tier.
 // ═══════════════════════════════════════════
 const TierEngine = (() => {
-  // Tier order: lock > split > need > weak > avoid
-  // confidence: how certain you are (drives Edge scoring)
-  // situation:  what the context demands (drives parlay routing)
-  // parlayTiers: which parlay output tiers this pick is eligible for
-  // baseCap:    max appearances across parlays before history adjusts
-  // splitHedge: does this tier trigger the dog/money hedge distribution?
+  // Actuarially calibrated priors — anchored to MLB run line base rate.
+  // Dog covers ~50% base rate. Our edge above that = information value.
+  // No tier starts above 0.68 — baseball humbles everyone.
+  //
+  // primaryDog:   P(win) when your pick is the +1.5 side
+  // primaryFav:   P(win) when your pick is the -1.5 side
+  // hedgeDogRatio: fraction of opponent hedge slots going to dog side
+  // hedgeFavRatio: fraction of opponent hedge slots going to fav side
+  // primarySlots:  Kelly-derived primary parlay slots (out of 20)
+  // hedgeSlots:    Insurance slots for opponent side
+  // parlayTiers:   which output tiers this pick routes to
+  // baseCap:       max appearances before history adjusts
   const TIERS = {
-    lock:  { label:'Lock',         color:'var(--green-l)',  confidence:1.0, situation:'favorable', parlayTiers:['lottery','core','grind'], baseCap:6, splitHedge:false },
-    split: { label:'Split',        color:'var(--teal-l)',   confidence:1.0, situation:'uncertain', parlayTiers:['lottery','core','grind'], baseCap:8, splitHedge:true  },
-    need:  { label:'Need Win',     color:'var(--blue-l)',   confidence:0.7, situation:'forced',    parlayTiers:['core','grind'],           baseCap:5, splitHedge:false },
-    weak:  { label:'Not Confident',color:'var(--amber-l)',  confidence:0.4, situation:'uncertain', parlayTiers:['lottery'],               baseCap:2, splitHedge:false },
-    avoid: { label:'Avoid',        color:'var(--red-l)',    confidence:0.0, situation:'unknown',   parlayTiers:[],                        baseCap:0, splitHedge:false },
+    lock: {
+      label: 'Lock', color: 'var(--green-l)',
+      situation: 'favorable', splitHedge: false,
+      primaryDog:  0.68,  // dog Lock — ace + momentum + +1.5 insurance
+      primaryFav:  0.65,  // fav Lock — must win by 2, slightly harder
+      hedgeDogPct: 0.15,  // 15% opponent ML slots — even Locks lose
+      hedgeFavPct: 0.20,  // 20% opponent +1.5 slots — fav needs bigger hedge
+      primarySlots: 8,    // Kelly: maximize edge picks
+      hedgeSlots:   3,    // insurance across grind tier only
+      parlayTiers: ['lottery','core','grind'],
+      baseCap: 8,
+      confidence: 0.68,   // used by EdgeScorer
+    },
+    split: {
+      label: 'Split', color: 'var(--teal-l)',
+      situation: 'uncertain', splitHedge: true,
+      // Split ratios handled entirely by SplitEngine
+      // quality vs low distinction lives in pick.splitQuality
+      primaryDog:  0.55,
+      primaryFav:  0.45,
+      hedgeDogPct: 0,     // N/A — SplitEngine handles distribution
+      hedgeFavPct: 0,
+      primarySlots: 0,    // N/A — SplitEngine allocates
+      hedgeSlots:   0,
+      parlayTiers: ['lottery','core','grind'],
+      baseCap: 8,
+      confidence: 0.55,
+    },
+    need: {
+      label: 'Need Win', color: 'var(--blue-l)',
+      situation: 'forced', splitHedge: false,
+      primaryDog:  0.60,  // need win dog: urgency + +1.5 insurance
+      primaryFav:  0.58,  // need win fav: urgency but must win by 2
+      hedgeDogPct: 0.25,  // 25% opponent ML — opponent can respond
+      hedgeFavPct: 0.30,  // 30% opponent +1.5 — fav needs more hedge
+      primarySlots: 5,    // core + grind only
+      hedgeSlots:   2,    // lottery only — opponent exposure
+      parlayTiers: ['core','grind'],
+      baseCap: 5,
+      confidence: 0.60,
+    },
+    weak: {
+      label: 'Not Confident', color: 'var(--amber-l)',
+      situation: 'uncertain', splitHedge: false,
+      primaryDog:  0.52,  // near coin flip with dog insurance
+      primaryFav:  0.48,  // negative Kelly standalone — hedge territory
+      hedgeDogPct: 0.40,  // 40% opponent ML — real uncertainty
+      hedgeFavPct: 0.45,  // 45% opponent +1.5 — highest hedge ratio
+      primarySlots: 2,    // lottery only
+      hedgeSlots:   2,    // grind only — opponent +1.5 insurance
+      parlayTiers: ['lottery'],
+      baseCap: 2,
+      confidence: 0.52,
+    },
+    avoid: {
+      label: 'Avoid', color: 'var(--red-l)',
+      situation: 'unknown', splitHedge: false,
+      primaryDog:  0.0,
+      primaryFav:  0.0,
+      hedgeDogPct: 0,
+      hedgeFavPct: 0,
+      primarySlots: 0,
+      hedgeSlots:   0,
+      parlayTiers: [],
+      baseCap: 0,
+      confidence: 0.0,
+    },
   };
-  const get     = key => TIERS[key] || TIERS.weak;
-  const isValid = key => key in TIERS;
+
+  const get      = key => TIERS[key] || TIERS.weak;
+  const isValid  = key => key in TIERS;
   const eligible = (key, parlayTier) => (TIERS[key]?.parlayTiers || []).includes(parlayTier);
   const CONF_KEYS = ['lock','split','need','weak','avoid'];
-  return { get, isValid, eligible, CONF_KEYS, TIERS };
+
+  // Bühlmann credibility weight: how much to trust observed rate vs prior
+  // k=20 means full credibility at ~40 results
+  const credibility = (n, k = 20) => n / (n + k);
+
+  // True probability for a pick using actuarial credibility blending
+  const trueProbability = (team, tierKey, isDog) => {
+    const tier     = get(tierKey);
+    const prior    = isDog ? tier.primaryDog : tier.primaryFav;
+    const log      = Store.get('teamLog')[team];
+    const n        = log ? (log.wins + log.losses) : 0;
+    if (n < 3)     return prior; // not enough data — use prior only
+    const observed = log.wins / n;
+    const Z        = credibility(n);
+    return Z * observed + (1 - Z) * prior;
+  };
+
+  // Edge above implied probability (sportsbook -110 = 52.4% implied)
+  const IMPLIED_PROB = 100 / 210; // ~0.524
+  const edge = (team, tierKey, isDog) =>
+    trueProbability(team, tierKey, isDog) - IMPLIED_PROB;
+
+  return { get, isValid, eligible, CONF_KEYS, TIERS, credibility, trueProbability, edge, IMPLIED_PROB };
 })();
 
 // ═══════════════════════════════════════════
@@ -600,52 +775,61 @@ const Validation = (() => {
 })();
 
 // ═══════════════════════════════════════════
-// SPLIT ENGINE
-// Calculates the dog/money ratio for Split games.
-// Default: 60% dog / 40% money (dog-favored).
-// Adjusts toward historical win rates as data accumulates.
-// Uses a Bayesian weight that scales 0->1 as n increases.
+// SPLIT ENGINE v2
+// Quality vs Low distinction.
+// Bühlmann credibility weighting.
+// Dog flag is purely informational (sportsbook data).
+// Ratio determined by: quality type + history + credibility.
 // ═══════════════════════════════════════════
 const SplitEngine = (() => {
-  const DEFAULT_DOG_RATIO = 0.60;
-  const MIN_HISTORY       = 5;   // samples needed before history influences ratio
-  const MAX_HISTORY_WEIGHT= 0.80; // max influence of history (never fully override intuition)
+  // Quality split: two good teams, close indicators
+  // Low split: two bad teams, or unclear indicators
+  const DEFAULTS = {
+    quality: { dog: 0.60, money: 0.40 },
+    low:     { dog: 0.55, money: 0.45 },
+  };
+  const MIN_HISTORY        = 5;
+  const MAX_HISTORY_WEIGHT = 0.80;
+  const K_CREDIBILITY      = 20; // Bühlmann k parameter
 
-  // Returns { dogRatio, moneyRatio } for a split game
-  const ratio = (dogTeam, moneyTeam) => {
+  // Bühlmann credibility weight
+  const Z = n => n / (n + K_CREDIBILITY);
+
+  // Returns { dogRatio, moneyRatio } using credibility-blended history
+  const ratio = (dogTeam, moneyTeam, quality = 'quality') => {
+    const defaults  = DEFAULTS[quality] || DEFAULTS.quality;
     const splitLog  = Store.get('splitLog');
     const dogLog    = splitLog[dogTeam]   || { dogWins:0, dogLosses:0 };
     const moneyLog  = splitLog[moneyTeam] || { moneyWins:0, moneyLosses:0 };
     const dogN      = dogLog.dogWins   + dogLog.dogLosses;
     const moneyN    = moneyLog.moneyWins + moneyLog.moneyLosses;
     const n         = dogN + moneyN;
-    if (n < MIN_HISTORY) return { dogRatio: DEFAULT_DOG_RATIO, moneyRatio: 1 - DEFAULT_DOG_RATIO };
-    // Bayesian weight: how much to trust history vs default
+
+    if (n < MIN_HISTORY)
+      return { dogRatio: defaults.dog, moneyRatio: defaults.money, credibilityZ: 0 };
+
+    const credZ        = Z(n);
     const histWeight   = Math.min(n / 20, 1) * MAX_HISTORY_WEIGHT;
-    const dogWinRate   = dogN   > 0 ? dogLog.dogWins     / dogN   : DEFAULT_DOG_RATIO;
-    const moneyWinRate = moneyN > 0 ? moneyLog.moneyWins / moneyN : (1 - DEFAULT_DOG_RATIO);
+    const dogWinRate   = dogN   > 0 ? dogLog.dogWins     / dogN   : defaults.dog;
+    const moneyWinRate = moneyN > 0 ? moneyLog.moneyWins / moneyN : defaults.money;
     const rawDog       = dogWinRate / (dogWinRate + moneyWinRate || 1);
-    const blended      = DEFAULT_DOG_RATIO * (1 - histWeight) + rawDog * histWeight;
-    const dogRatio     = Math.max(0.2, Math.min(0.8, blended)); // clamp 20-80%
-    return { dogRatio, moneyRatio: 1 - dogRatio };
+    const blended      = defaults.dog * (1 - histWeight) + rawDog * histWeight;
+    const dogRatio     = Math.max(0.20, Math.min(0.80, blended));
+    return { dogRatio, moneyRatio: 1 - dogRatio, credibilityZ: credZ };
   };
 
   // Distribute a split game across N parlays
-  // Returns array of { team, isDog } assignments, one per parlay slot
-  const distribute = (dogTeam, moneyTeam, totalParlays) => {
-    const { dogRatio } = ratio(dogTeam, moneyTeam);
+  const distribute = (dogTeam, moneyTeam, totalParlays, quality = 'quality') => {
+    const { dogRatio } = ratio(dogTeam, moneyTeam, quality);
     const dogCount     = Math.round(dogRatio * totalParlays);
-    const assignments  = [];
-    for (let i = 0; i < totalParlays; i++) {
-      assignments.push(i < dogCount
-        ? { team: dogTeam,   isDog: true  }
-        : { team: moneyTeam, isDog: false });
-    }
-    return assignments;
+    return Array.from({ length: totalParlays }, (_, i) =>
+      i < dogCount
+        ? { team: dogTeam,   isDog: true,  splitQuality: quality }
+        : { team: moneyTeam, isDog: false, splitQuality: quality }
+    );
   };
 
-  // Log a split result for future ratio calibration
-  const logResult = (team, wasDog, won) => {
+  const logSplitResult = (team, wasDog, won) => {
     Store.upd('splitLog', log => {
       const entry = log[team] || { dogWins:0, dogLosses:0, moneyWins:0, moneyLosses:0 };
       if (wasDog  && won)  entry.dogWins++;
@@ -656,69 +840,123 @@ const SplitEngine = (() => {
     });
   };
 
-  return { ratio, distribute, logResult };
+  return { ratio, distribute, logSplitResult, DEFAULTS };
 })();
 
 // ═══════════════════════════════════════════
-// OVERLAP ENGINE
-// Per-team max appearances, derived automatically.
-// Confidence tier sets base cap.
-// Historical win rate adjusts it up or down.
+// OVERLAP ENGINE v2
+// Kelly-adjusted caps — base from TierEngine,
+// modified by actuarial credibility-weighted win rate.
+// Dog/favorite distinction in cap calculation.
 // ═══════════════════════════════════════════
 const OverlapEngine = (() => {
-  const teamCap = (team, tierKey) => {
-    const base = TierEngine.get(tierKey).baseCap;
-    if (base === 0) return 0; // avoid — always excluded
+  const teamCap = (team, tierKey, isDog = false) => {
+    const tier = TierEngine.get(tierKey);
+    const base = tier.baseCap;
+    if (base === 0) return 0; // avoid always excluded
+
+    // Use Kelly fraction to scale cap
+    // Higher Kelly = more confident = higher cap
+    const kf      = Edge.kellyFraction(team, tierKey, isDog);
+    const kellyAdj = Math.round(kf * 20); // scale to 0-20 range
+
+    // Blend base cap with Kelly adjustment using credibility
     const log  = Store.get('teamLog')[team];
-    if (!log || (log.wins + log.losses) < 3) return base;
-    const wr = log.wins / (log.wins + log.losses);
-    if (wr >= 0.65) return Math.min(base + 2, 10);
-    if (wr >= 0.50) return base;
-    if (wr >= 0.35) return Math.max(base - 1, 1);
-    return Math.max(base - 2, 1);
+    const n    = log ? (log.wins + log.losses) : 0;
+    const Z    = TierEngine.credibility(n);
+
+    // At Z=0: use base cap only. At Z=1: blend fully with Kelly
+    const blended = Math.round((1 - Z) * base + Z * Math.min(kellyAdj, base + 2));
+    return Math.max(1, Math.min(blended, 10));
   };
 
   const buildCapMap = picks =>
-    Object.fromEntries(picks.map(p => [p.team, teamCap(p.team, p.confidence)]));
+    Object.fromEntries(picks.map(p => [p.team, teamCap(p.team, p.confidence, p.isDog || false)]));
 
   return { teamCap, buildCapMap };
 })();
 
 // ═══════════════════════════════════════════
-// EDGE SCORER
-// Scores a pick 0-1.
-// Blends tier confidence weight with team + tier history.
+// EDGE SCORER v2
+// Uses actuarial Bühlmann credibility blending.
+// Prior = TierEngine calibrated probability.
+// Observed = your actual win rate on this team/tier.
+// Blend transitions from prior to observed as n grows.
+// isDog flag differentiates dog vs favorite probability.
 // ═══════════════════════════════════════════
 const Edge = (() => {
+  const K_TEAM = 20; // credibility threshold for team history
+  const K_TIER = 30; // higher threshold for tier — needs more data
+
   const teamWinRate = team => {
     const l = Store.get('teamLog')[team];
     if (!l || (l.wins + l.losses) < 3) return null;
     return l.wins / (l.wins + l.losses);
   };
+
   const tierWinRate = key => {
     const l = Store.get('tierLog')[key];
     if (!l || (l.wins + l.losses) < 5) return null;
     return l.wins / (l.wins + l.losses);
   };
-  const sc = (team, tierKey) => {
-    let e  = TierEngine.get(tierKey).confidence;
-    const tw = teamWinRate(team);
-    const ti = tierWinRate(tierKey);
-    if (tw !== null) e = e * 0.5 + tw * 0.5;
-    if (ti !== null) e = e * 0.7 + ti * 0.3;
+
+  // Bühlmann credibility score for a pick
+  // Uses tier actuarial prior + team observed rate + tier observed rate
+  const sc = (team, tierKey, isDog = false) => {
+    const tier   = TierEngine.get(tierKey);
+    const prior  = isDog ? tier.primaryDog : tier.primaryFav;
+
+    // Team credibility blend
+    const teamLog = Store.get('teamLog')[team];
+    const teamN   = teamLog ? (teamLog.wins + teamLog.losses) : 0;
+    const teamObs = teamN >= 3 ? teamLog.wins / teamN : null;
+    const teamZ   = teamN / (teamN + K_TEAM);
+
+    // Tier credibility blend
+    const tierLog = Store.get('tierLog')[tierKey];
+    const tierN   = tierLog ? (tierLog.wins + tierLog.losses) : 0;
+    const tierObs = tierN >= 5 ? tierLog.wins / tierN : null;
+    const tierZ   = tierN / (tierN + K_TIER);
+
+    // Start with actuarial prior
+    let e = prior;
+
+    // Blend in team observed rate using credibility weight
+    if (teamObs !== null)
+      e = (1 - teamZ) * e + teamZ * teamObs;
+
+    // Blend in tier observed rate using credibility weight
+    if (tierObs !== null)
+      e = (1 - tierZ) * e + tierZ * tierObs;
+
     return Math.min(Math.max(e, 0), 1);
   };
-  return { sc, teamWinRate };
+
+  // Kelly fraction for a pick: f* = (p*b - q) / b
+  // b = net odds at -110 = 0.9091
+  const kellyFraction = (team, tierKey, isDog) => {
+    const p = sc(team, tierKey, isDog);
+    const q = 1 - p;
+    const b = 100 / 110; // -110 net odds
+    return Math.max(0, (p * b - q) / b);
+  };
+
+  return { sc, teamWinRate, tierWinRate, kellyFraction };
 })();
 
 // ═══════════════════════════════════════════
-// PARLAY OPTIMIZER
-// Builds N parlays respecting:
-//   - Tier eligibility (lock/split/need/weak/avoid routing)
-//   - Split distribution (SplitEngine ratios)
-//   - Per-team overlap caps (OverlapEngine)
-//   - No both sides of same game in one parlay
-//   - Decorrelated coverage (shuffle + edge scoring)
+// PARLAY OPTIMIZER v2
+// Full implementation of three-lens math:
+//   - Actuarial: credibility-weighted probabilities
+//   - Kelly: slot allocation from derived edge
+//   - Behavioral: opponent hedge slots per tier
+//
+// Each non-split pick generates:
+//   PRIMARY slots: your picked team (tier-capped)
+//   HEDGE slots:   opponent side (dog/fav aware)
+//
+// Split picks handled by SplitEngine distribution.
+// No single game kills more than its capped maximum.
 // ═══════════════════════════════════════════
 const Optimizer = (() => {
   const shuf = arr => {
@@ -734,11 +972,45 @@ const Optimizer = (() => {
     legs <= 4 ? 'var(--green-l)' : legs <= 6 ? 'var(--amber-l)' :
     legs <= 9 ? 'var(--red-l)'   : 'var(--purple-l)';
 
-  // Build one parlay from a pool, respecting caps and game uniqueness
+  // Build opponent hedge pick for a given primary pick
+  // Dog flag determines which side the hedge takes
+  const buildHedgePick = (primaryPick, game) => {
+    if (!game) return null;
+    const tier       = TierEngine.get(primaryPick.confidence);
+    const primaryIsDog = primaryPick.isDog;
+
+    // Hedge is always the OTHER side of the game
+    const hedgeTeam  = primaryPick.team === game.awayTeam ? game.homeTeam : game.awayTeam;
+    // If primary is dog, hedge is money (opponent ML)
+    // If primary is fav, hedge is dog (opponent +1.5)
+    const hedgeIsDog = !primaryIsDog;
+    const hedgePct   = primaryIsDog ? tier.hedgeDogPct : tier.hedgeFavPct;
+
+    return {
+      team:        hedgeTeam,
+      isDog:       hedgeIsDog,
+      confidence:  primaryPick.confidence,
+      gameId:      primaryPick.gameId,
+      pocket:      primaryPick.pocket,
+      gameTime:    primaryPick.gameTime,
+      isHedge:     true,
+      hedgePct,
+    };
+  };
+
+  // Parlay survival score: probability all legs win
+  // Uses actuarial true probabilities
+  const survivalScore = legs => {
+    return legs.reduce((p, l) => p * Edge.sc(l.team, l.confidence, l.isDog || false), 1);
+  };
+
+  // Build one parlay
   const oneParlay = (pool, legs, existing, capMap, id) => {
-    // Hoist: count map computed once per parlay, not inside the attempt loop
+    // Hoist count map above attempt loop
     const countMap = {};
-    existing.forEach(p => p.legs.forEach(l => { countMap[l.team] = (countMap[l.team] || 0) + 1; }));
+    existing.forEach(p => p.legs.forEach(l => {
+      countMap[l.team] = (countMap[l.team] || 0) + 1;
+    }));
 
     let best = null, bestScore = -Infinity;
 
@@ -749,9 +1021,7 @@ const Optimizer = (() => {
 
       for (const pick of shuffled) {
         if (candidate.length >= legs) break;
-        // Enforce per-team cap
         if ((countMap[pick.team] || 0) >= (capMap[pick.team] || 4)) continue;
-        // Enforce one side per game
         if (seenGames.has(pick.gameId)) continue;
         seenGames.add(pick.gameId);
         candidate.push(pick);
@@ -759,14 +1029,14 @@ const Optimizer = (() => {
 
       if (candidate.length < legs) continue;
 
-      const penalty   = candidate.reduce((s, p) => s + (countMap[p.team] || 0), 0);
-      const edgeSum   = candidate.reduce((s, p) => s + Edge.sc(p.team, p.confidence), 0);
-      const score     = edgeSum / legs - penalty * 0.12 + Math.random() * 0.08;
+      const penalty  = candidate.reduce((s, p) => s + (countMap[p.team] || 0), 0);
+      const edgeSum  = candidate.reduce((s, p) =>
+        s + Edge.sc(p.team, p.confidence, p.isDog || false), 0);
+      const score    = edgeSum / legs - penalty * 0.12 + Math.random() * 0.08;
 
       if (score > bestScore) { bestScore = score; best = candidate; }
     }
 
-    // Fallback: greedy unique-game selection
     if (!best) {
       const seenGames = new Set();
       best = [];
@@ -776,60 +1046,82 @@ const Optimizer = (() => {
       }
     }
 
+    const survival = survivalScore(best);
     return {
       id,
-      legs:      best,
-      legCount:  best.length,
-      edgeScore: best.reduce((s, p) => s + Edge.sc(p.team, p.confidence), 0) / best.length,
+      legs:         best,
+      legCount:     best.length,
+      edgeScore:    best.reduce((s, p) => s + Edge.sc(p.team, p.confidence, p.isDog || false), 0) / best.length,
+      survivalScore: survival,
     };
   };
 
   const build = (userPicks, { targetCount, maxLegs }) => {
     if (!userPicks.length) return [];
 
-    const games   = Store.get('games');
-    const capMap  = OverlapEngine.buildCapMap(userPicks);
+    const games = Store.get('games');
 
-    // Separate splits from non-splits
-    const splits    = userPicks.filter(p => p.confidence === 'split');
-    const nonSplits = userPicks.filter(p => p.confidence !== 'split' && p.confidence !== 'avoid');
-
-    // Build split slot assignments across all parlays
-    // Each split game gets a distribution array of length targetCount
-    const splitAssignments = {}; // gameId -> array of { team, isDog, confidence:'split', gameId, pocket }
-    splits.forEach(pk => {
-      const game = games.find(g => g.id === pk.gameId || g.awayTeam === pk.team || g.homeTeam === pk.team);
-      if (!game) return;
-      const dogTeam   = game.dog === 'away' ? game.awayTeam : game.homeTeam;
-      const moneyTeam = game.dog === 'away' ? game.homeTeam : game.awayTeam;
-      splitAssignments[game.id] = SplitEngine.distribute(dogTeam, moneyTeam, targetCount)
-        .map(a => ({ ...a, confidence: 'split', gameId: game.id, pocket: pk.pocket }));
-    });
-
-    // Enrich non-split picks with gameId
-    nonSplits.forEach(p => {
+    // Enrich picks with gameId
+    userPicks.forEach(p => {
       if (!p.gameId) {
         const g = games.find(g => g.awayTeam === p.team || g.homeTeam === p.team);
         if (g) p.gameId = g.id;
       }
     });
 
+    const splits    = userPicks.filter(p => p.confidence === 'split');
+    const nonSplits = userPicks.filter(p => p.confidence !== 'split' && p.confidence !== 'avoid');
+
+    // Build opponent hedge picks for all non-split tiers
+    // Each pick generates a hedge pick for the opponent side
+    const hedgePicks = [];
+    nonSplits.forEach(pk => {
+      const game  = games.find(g => g.id === pk.gameId);
+      const hedge = buildHedgePick(pk, game);
+      if (hedge) hedgePicks.push(hedge);
+    });
+
+    // Build split assignments using quality distinction
+    const splitAssignments = {};
+    splits.forEach(pk => {
+      const game = games.find(g => g.id === pk.gameId || g.awayTeam === pk.team || g.homeTeam === pk.team);
+      if (!game) return;
+      const dogTeam    = game.dog === 'away' ? game.awayTeam : game.homeTeam;
+      const moneyTeam  = game.dog === 'away' ? game.homeTeam : game.awayTeam;
+      const quality    = pk.splitQuality || 'quality';
+      splitAssignments[game.id] = SplitEngine.distribute(dogTeam, moneyTeam, targetCount, quality)
+        .map(a => ({ ...a, confidence: 'split', gameId: game.id, pocket: pk.pocket }));
+    });
+
+    // Build cap map including hedge picks
+    const allPicks  = [...nonSplits, ...hedgePicks];
+    const capMap    = OverlapEngine.buildCapMap(allPicks);
+
     let ctr = Date.now();
     const parlays = [];
 
-    // Parlay tier counts
     const lotteryCount = Math.min(2, Math.floor(targetCount * 0.1));
     const coreCount    = Math.floor(targetCount * 0.3);
     const grindCount   = targetCount - lotteryCount - coreCount;
 
-    const buildTier = (tier, count, legCount) => {
-      // Filter pool to picks eligible for this parlay tier
+    const buildTier = (tier, count, legCount, allowHedge = true) => {
       const eligible = nonSplits.filter(p => TierEngine.eligible(p.confidence, tier));
+      // Hedge picks route to specific tiers based on tier engine
+      // Lock hedges -> grind only
+      // Need Win hedges -> lottery only
+      // Not Confident hedges -> grind only
+      const hedgeEligible = allowHedge ? hedgePicks.filter(p => {
+        const t = p.confidence;
+        if (t === 'lock')  return tier === 'grind';
+        if (t === 'need')  return tier === 'lottery';
+        if (t === 'weak')  return tier === 'grind';
+        return false;
+      }) : [];
+
       for (let i = 0; i < count; i++) {
         const parlayIndex = parlays.length;
-        // Inject this parlay's split assignments
-        const splitLegs = Object.values(splitAssignments).map(arr => arr[parlayIndex] || arr[0]);
-        const pool      = [...eligible, ...splitLegs];
+        const splitLegs   = Object.values(splitAssignments).map(arr => arr[parlayIndex] || arr[0]);
+        const pool        = [...eligible, ...hedgeEligible, ...splitLegs];
         if (pool.length < 2) continue;
         const p = oneParlay(pool, Math.min(legCount, pool.length), parlays, capMap, ctr++);
         p.tier  = tier;
@@ -837,14 +1129,14 @@ const Optimizer = (() => {
       }
     };
 
-    buildTier('lottery', lotteryCount, Math.min(maxLegs, nonSplits.length + splits.length));
-    buildTier('core',    coreCount,    Math.min(7, nonSplits.length + splits.length));
-    buildTier('grind',   grindCount,   Math.min(5, nonSplits.length + splits.length));
+    buildTier('lottery', lotteryCount, Math.min(maxLegs, allPicks.length + splits.length));
+    buildTier('core',    coreCount,    Math.min(7, allPicks.length + splits.length));
+    buildTier('grind',   grindCount,   Math.min(5, allPicks.length + splits.length));
 
     return parlays;
   };
 
-  return { build, diffColor };
+  return { build, diffColor, survivalScore };
 })();
 
 // ═══════════════════════════════════════════
@@ -1111,6 +1403,9 @@ const renderSlate = () => {
       flagged && flagSeverity === 'warn' ? 'fw' : '',
     ].filter(Boolean).join(' ');
 
+    const gameType = MLBMap.classify(g.awayTeam, g.homeTeam);
+    const gameTypePill = `<span class="game-type-pill gtp-${gameType.type}" title="${esc(gameType.division)}">${gameType.label}</span>`;
+
     const asc = pk.side === 'away' ? 'gpick sa' : 'gpick';
     const hsc = pk.side === 'home' ? 'gpick sh' : 'gpick';
 
@@ -1119,12 +1414,18 @@ const renderSlate = () => {
       const active = pk.side && cv === k ? ` ck-${k}` : '';
       return `<button class="gcb${active}" onclick="setConf('${g.id}','${k}')" aria-pressed="${pk.side && cv===k}">${t.label}</button>`;
     }).join('');
+    const sq = pk.splitQuality || 'quality';
+    const splitQualityToggle = pk.side && cv === 'split' ? `<div class="sq-toggle">
+      <button class="sqb${sq==='quality'?' sq-active':''}" onclick="setSplitQuality('${g.id}','quality')">Quality split</button>
+      <button class="sqb${sq==='low'?' sq-active':''}" onclick="setSplitQuality('${g.id}','low')">Low split</button>
+    </div>` : '';
 
     return `<div class="${gcClass}" id="gc-${g.id}">
       <div class="gc-stripe"></div>
       <div class="gc-head">
         <span class="gc-time">${esc(g.gameTime)}</span>
         <span class="gc-pocket">${UI.pocket(g.gameTime)}</span>
+        ${gameTypePill}
         <span class="gc-flag" aria-label="${esc(flagTxt||'')}">&#9888; ${esc(flagTxt||'')}</span>
         <span class="gc-spacer"></span>
         <button class="gc-flip" onclick="setDog('${g.id}','${g.dog==='away'?'home':'away'}')" aria-label="Flip underdog">&#8644; flip dog</button>
@@ -1145,6 +1446,7 @@ const renderSlate = () => {
         </button>
       </div>
       <div class="gc-conf" role="group" aria-label="Confidence tier">${confBtns}</div>
+      ${splitQualityToggle}
       ${(() => {
         const aCtx = Validation.recentContext(g.awayTeam);
         const hCtx = pk.side ? Validation.recentContext(pk.side==='away'?g.awayTeam:g.homeTeam) : [];
@@ -1188,9 +1490,9 @@ const renderParlays = (parlays, picks) => {
   </div>`;
 
   const lp = l => {
-    const tier  = TierEngine.get(l.confidence);
-    const rl    = l.isDog !== undefined ? (l.isDog ? '+1.5' : '-1.5') : '';
-    return `<span class="lp lp-${l.confidence}">${esc(l.team)}${rl ? ` <span class="lp-rl">${rl}</span>` : ''}</span>`;
+    const rl      = l.isDog !== undefined ? (l.isDog ? '+1.5' : '-1.5') : '';
+    const hedgeCls = l.isHedge ? ' lp-hedge' : '';
+    return `<span class="lp lp-${l.confidence}${hedgeCls}">${esc(l.team)}${rl ? ` <span class="lp-rl">${rl}</span>` : ''}</span>`;
   };
 
   const TM = {
@@ -1214,7 +1516,12 @@ const renderParlays = (parlays, picks) => {
             <span class="pbadge ${m.bc}">${tier}</span>
             <span class="pc-meta">#${i+1} &middot; ${p.legCount} legs${splits ? ` &middot; ${splits} split` : ''}</span>
           </div>
-          <span class="pc-edge">edge ${Math.round(p.edgeScore*100)}%</span>
+          <div style="display:flex;flex-direction:column;align-items:flex-end;gap:2px">
+            <span class="pc-edge">edge ${Math.round(p.edgeScore*100)}%</span>
+            <span class="survival ${p.survivalScore>=0.05?'survival-good':p.survivalScore>=0.01?'survival-ok':'survival-hard'}">
+              survival ${(p.survivalScore*100).toFixed(1)}%
+            </span>
+          </div>
         </div>
         <div class="pc-legs">${p.legs.map(lp).join('')}</div>
         <div class="diff-track"><div class="diff-fill" style="width:${fw}%;background:${dc}"></div></div>
@@ -1259,36 +1566,32 @@ const renderResults = () => {
     ? `<div class="nudge"><div class="nudge-dot"></div>${pending.length} parlay${pending.length>1?'s':''} waiting for results.</div>`
     : '';
 
-  // Primary action: ESPN auto-fetch button
+  // Results section: manual buttons always visible and primary
+  // ESPN auto-fetch is a secondary convenience button at the top
   const fetchBtn = pending.length ? `<div style="background:var(--ink2);border:1px solid var(--line);border-radius:var(--rl);padding:14px 16px;margin-bottom:10px">
-    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;flex-wrap:wrap;gap:8px">
       <span style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.07em;color:var(--fg3)">Pending (${pending.length})</span>
+      <button class="fetch-btn" style="width:auto;padding:5px 12px;font-size:11px" onclick="autoEvalResults()">
+        &#8635; Auto-fetch from ESPN
+      </button>
     </div>
-    <button class="fetch-btn" onclick="autoEvalResults()">
-      &#8635; Fetch results from ESPN &rarr; auto-evaluate all ${pending.length} parlays
-    </button>
-    <div style="font-size:10px;color:var(--fg3);margin-top:8px;text-align:center">
-      Uses your locked-in dog picks &#183; run line margin-aware &#183; or log manually below
-    </div>
-    <div style="margin-top:12px">
-      ${pending.map(p => `<div class="rrow">
-        <div class="rinfo">
-          <div class="rname">
-            <span class="pbadge ${TBC[p.tier]||'pb-grind'}">${p.tier}</span>
-            ${p.legCount} legs
-          </div>
-          <div class="rlegs">${p.legs.map(l => {
-            const rl = l.isDog !== undefined ? `<span style="font-size:9px;opacity:.6"> ${l.isDog?'+1.5':'ML'}</span>` : '';
-            return `<span class="rleg">${esc(l.team)}${rl}</span>`;
-          }).join('')}</div>
+    ${pending.map(p => `<div class="rrow">
+      <div class="rinfo">
+        <div class="rname">
+          <span class="pbadge ${TBC[p.tier]||'pb-grind'}">${p.tier}</span>
+          ${p.legCount} legs
         </div>
-        <div class="ogrp">
-          <button class="obtn ob-w" onclick="logResult('${p.id}','win')"  aria-label="Win">Win</button>
-          <button class="obtn ob-l" onclick="logResult('${p.id}','loss')" aria-label="Loss">Loss</button>
-          <button class="obtn ob-p" onclick="logResult('${p.id}','push')" aria-label="Push">Push</button>
-        </div>
-      </div>`).join('')}
-    </div>
+        <div class="rlegs">${p.legs.map(l => {
+          const rl = l.isDog !== undefined ? `<span style="font-size:9px;opacity:.6"> ${l.isDog?'+1.5':'ML'}</span>` : '';
+          return `<span class="rleg">${esc(l.team)}${rl}</span>`;
+        }).join('')}</div>
+      </div>
+      <div class="ogrp">
+        <button class="obtn ob-w" onclick="logResult('${p.id}','win')"  aria-label="Win">Win</button>
+        <button class="obtn ob-l" onclick="logResult('${p.id}','loss')" aria-label="Loss">Loss</button>
+        <button class="obtn ob-p" onclick="logResult('${p.id}','push')" aria-label="Push">Push</button>
+      </div>
+    </div>`).join('')}
   </div>` : '';
 
   const doneHTML = done.length ? `<div style="background:var(--ink2);border:1px solid var(--line);border-radius:var(--rl);padding:14px 16px">
@@ -1552,14 +1855,23 @@ const togglePick = (gameId, side) => {
       [gameId]: {
         gameId,
         side,
-        team:       side === 'away' ? game.awayTeam : game.homeTeam,
-        isDog:      game.dog === side,
-        confidence: cur?.confidence || 'need',
-        gameTime:   game.gameTime,
-        pocket:     UI.pocket(game.gameTime),
+        team:         side === 'away' ? game.awayTeam : game.homeTeam,
+        isDog:        game.dog === side,
+        confidence:   cur?.confidence || 'need',
+        splitQuality: cur?.splitQuality || 'quality',
+        gameTime:     game.gameTime,
+        pocket:       UI.pocket(game.gameTime),
       },
     });
   }
+  renderSlate();
+};
+
+const setSplitQuality = (gameId, quality) => {
+  Store.upd('picks', picks => ({
+    ...picks,
+    [gameId]: { ...picks[gameId], splitQuality: quality },
+  }));
   renderSlate();
 };
 
@@ -1638,7 +1950,7 @@ const logResult = (parlayId, outcome) => {
     });
     // Log split results for ratio calibration
     if (l.confidence === 'split' && l.isDog !== undefined) {
-      SplitEngine.logResult(l.team, l.isDog, outcome === 'win');
+      SplitEngine.logSplitResult(l.team, l.isDog, outcome === 'win');
     }
   });
 
@@ -1702,7 +2014,7 @@ const confirmEvals = () => {
         return { ...log, [l.confidence]: r };
       });
       if (l.confidence === 'split' && l.isDog !== undefined) {
-        SplitEngine.logResult(l.team, l.isDog, l.outcome === 'win');
+        SplitEngine.logSplitResult(l.team, l.isDog, l.outcome === 'win');
       }
     });
   });
