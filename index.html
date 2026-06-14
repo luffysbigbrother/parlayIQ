@@ -386,6 +386,7 @@ const esc = s => typeof s !== 'string' ? '' :
   s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
    .replace(/"/g,'&quot;').replace(/'/g,'&#039;');
 
+// uid: monotonic counter seeded from Date.now() — collision-safe
 let _seq = Date.now();
 const uid = (p = 'x') => `${p}-${_seq++}`;
 
@@ -552,11 +553,12 @@ const TierEngine = (() => {
   // k=20 means full credibility at ~40 results
   const credibility = (n, k = 20) => n / (n + k);
 
-  // True probability for a pick using actuarial credibility blending
-  const trueProbability = (team, tierKey, isDog) => {
+  // True probability for a pick using actuarial credibility blending.
+  // teamLog passed as parameter — TierEngine does not read Store directly.
+  const trueProbability = (team, tierKey, isDog, teamLog = {}) => {
     const tier     = get(tierKey);
     const prior    = isDog ? tier.primaryDog : tier.primaryFav;
-    const log      = Store.get('teamLog')[team];
+    const log      = teamLog[team];
     const n        = log ? (log.wins + log.losses) : 0;
     if (n < 3)     return prior; // not enough data — use prior only
     const observed = log.wins / n;
@@ -566,8 +568,8 @@ const TierEngine = (() => {
 
   // Edge above implied probability (sportsbook -110 = 52.4% implied)
   const IMPLIED_PROB = 100 / 210; // ~0.524
-  const edge = (team, tierKey, isDog) =>
-    trueProbability(team, tierKey, isDog) - IMPLIED_PROB;
+  const edge = (team, tierKey, isDog, teamLog = {}) =>
+    trueProbability(team, tierKey, isDog, teamLog) - IMPLIED_PROB;
 
   return { get, isValid, eligible, CONF_KEYS, TIERS, credibility, trueProbability, edge, IMPLIED_PROB };
 })();
@@ -903,11 +905,12 @@ const Edge = (() => {
   // Bühlmann credibility score for a pick
   // Uses tier actuarial prior + team observed rate + tier observed rate
   const sc = (team, tierKey, isDog = false) => {
-    const tier   = TierEngine.get(tierKey);
-    const prior  = isDog ? tier.primaryDog : tier.primaryFav;
+    const tier        = TierEngine.get(tierKey);
+    const prior       = isDog ? tier.primaryDog : tier.primaryFav;
+    const allTeamLogs = Store.get('teamLog'); // EdgeScorer owns Store reads
 
     // Team credibility blend
-    const teamLog = Store.get('teamLog')[team];
+    const teamLog = allTeamLogs[team];
     const teamN   = teamLog ? (teamLog.wins + teamLog.losses) : 0;
     const teamObs = teamN >= 3 ? teamLog.wins / teamN : null;
     const teamZ   = teamN / (teamN + K_TEAM);
@@ -1181,35 +1184,47 @@ const ESPN = (() => {
     return (d.events || []).map(norm);
   };
 
-  // Fetch final scores for today's completed games.
-  // Returns map: { awayTeam -> { awayScore, homeScore, homeTeam, status } }
-  // Keyed by awayTeam name so we can look up by team name from picks.
+  // Fetch scores for today's games.
+  // Strategy: grab whatever ESPN has — any game with
+  // both scores present and a winner determined is usable.
+  // isDog flag on each leg handles the evaluation logic.
+  // No strict status check — if scores exist and differ, game is done.
   const fetchScores = async () => {
     const r = await window.fetch(
       `https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/scoreboard?dates=${todayStr()}`
     );
     if (!r.ok) throw new Error(`ESPN ${r.status}`);
-    const d    = await r.json();
-    const map  = {}; // teamName -> scoreObj
+    const d   = await r.json();
+    const map = {};
     (d.events || []).forEach(ev => {
-      const comp   = ev.competitions[0];
-      const status = comp.status?.type?.name || '';
-      // Only include completed games
-      if (!['STATUS_FINAL','STATUS_FINAL_OT','STATUS_POSTPONED'].includes(status) &&
-          !comp.status?.type?.completed) return;
+      const comp  = ev.competitions[0];
       const teams = comp.competitors;
       const away  = teams.find(t => t.homeAway === 'away') || teams[0];
       const home  = teams.find(t => t.homeAway === 'home') || teams[1];
-      const awayScore = parseInt(away.score ?? away.linescores?.reduce((s,l)=>s+(parseInt(l.value)||0),0) ?? 0);
-      const homeScore = parseInt(home.score ?? home.linescores?.reduce((s,l)=>s+(parseInt(l.value)||0),0) ?? 0);
+
+      // Parse scores — try direct score field first, then linescores
+      const awayScore = parseInt(away.score) ||
+        (away.linescores || []).reduce((s,l) => s + (parseInt(l.value) || 0), 0);
+      const homeScore = parseInt(home.score) ||
+        (home.linescores || []).reduce((s,l) => s + (parseInt(l.value) || 0), 0);
+
+      // Game is usable if: scores exist AND are different (clear winner)
+      // OR game is explicitly marked completed by ESPN
+      const hasScores   = !isNaN(awayScore) && !isNaN(homeScore);
+      const hasWinner   = hasScores && awayScore !== homeScore;
+      const isCompleted = comp.status?.type?.completed === true ||
+        ['STATUS_FINAL','STATUS_FINAL_OT'].includes(comp.status?.type?.name || '');
+
+      if (!hasWinner && !isCompleted) return;
+
       const entry = {
         awayTeam:  away.team.displayName,
         homeTeam:  home.team.displayName,
-        awayScore,
-        homeScore,
-        completed: true,
+        awayScore: awayScore || 0,
+        homeScore: homeScore || 0,
+        completed: isCompleted,
       };
-      // Index by both team names for easy lookup
+      // Index by both team names for easy leg lookup
       map[away.team.displayName] = entry;
       map[home.team.displayName] = entry;
     });
@@ -1244,10 +1259,12 @@ const ResultsEngine = (() => {
     const margin      = teamScore - otherScore; // positive = team won
 
     if (leg.isDog) {
-      // Dog covers +1.5 if they won outright OR lost by exactly 1
+      // Dog (+1.5): wins if team won outright OR lost by exactly 1
+      // Loses only if margin <= -2 (lost by 2 or more)
       return margin >= -1 ? 'win' : 'loss';
     } else {
-      // Money line: team must win outright
+      // Money line: team wins outright by any margin
+      // 1-run win, 10-run win — all the same on ML
       return margin > 0 ? 'win' : 'loss';
     }
   };
