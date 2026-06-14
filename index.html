@@ -1189,9 +1189,12 @@ const ESPN = (() => {
   // both scores present and a winner determined is usable.
   // isDog flag on each leg handles the evaluation logic.
   // No strict status check — if scores exist and differ, game is done.
-  const fetchScores = async () => {
+  // Accept optional dateStr — defaults to today
+  // This allows fetching scores for yesterday's parlays
+  const fetchScores = async (dateStr = null) => {
+    const target = dateStr || todayStr();
     const r = await window.fetch(
-      `https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/scoreboard?dates=${todayStr()}`
+      `https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/scoreboard?dates=${target}`
     );
     if (!r.ok) throw new Error(`ESPN ${r.status}`);
     const d   = await r.json();
@@ -1285,16 +1288,34 @@ const ResultsEngine = (() => {
     return { legResults, parlayOutcome };
   };
 
-  // Evaluate all pending parlays. Returns array of evaluation objects.
+  // Evaluate all pending parlays.
+  // Detects which date the parlays are from and fetches
+  // scores for that date — works for yesterday's parlays too.
   const evalAll = async () => {
-    const scoreMap = await ESPN.fetchScores();
     const parlays   = Store.get('parlays');
     const results   = Store.get('results');
     const loggedIds = new Set(results.map(r => r.parlayId));
-    const today     = new Date().toDateString();
-    const pending   = parlays.filter(p =>
-      new Date(p.date).toDateString() === today && !loggedIds.has(p.id)
-    );
+    const pending   = parlays.filter(p => !loggedIds.has(p.id));
+    if (!pending.length) return [];
+
+    // Determine which date(s) the pending parlays are from
+    // Group by date string to handle multi-day scenarios
+    const dateGroups = {};
+    pending.forEach(p => {
+      const d    = new Date(p.date);
+      // Format as YYYYMMDD for ESPN API
+      const dateStr = `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}`;
+      if (!dateGroups[dateStr]) dateGroups[dateStr] = [];
+      dateGroups[dateStr].push(p);
+    });
+
+    // Fetch scores for each unique date and merge into one map
+    const scoreMap = {};
+    for (const [dateStr, group] of Object.entries(dateGroups)) {
+      const dayScores = await ESPN.fetchScores(dateStr);
+      Object.assign(scoreMap, dayScores);
+    }
+
     return pending.map(p => ({
       parlay: p,
       ...evalParlay(p, scoreMap),
@@ -1576,23 +1597,27 @@ const renderResults = () => {
   }
 
   const pending = todayPs.filter(p => !loggedIds.has(p.id));
+  // Also include any unlogged parlays from previous days
+  const allPending = parlays.filter(p => !loggedIds.has(p.id));
+  const pastPending = allPending.filter(p => new Date(p.date).toDateString() !== today);
   const done    = results.filter(r => todayPs.find(p => p.id === r.parlayId));
   const TBC     = { lottery:'pb-lottery', core:'pb-core', grind:'pb-grind' };
 
-  const nudge = pending.length
-    ? `<div class="nudge"><div class="nudge-dot"></div>${pending.length} parlay${pending.length>1?'s':''} waiting for results.</div>`
+  const nudge = allUnlogged.length
+    ? `<div class="nudge"><div class="nudge-dot"></div>${allUnlogged.length} parlay${allUnlogged.length>1?'s':''} waiting for results.</div>`
     : '';
 
   // Results section: manual buttons always visible and primary
-  // ESPN auto-fetch is a secondary convenience button at the top
-  const fetchBtn = pending.length ? `<div style="background:var(--ink2);border:1px solid var(--line);border-radius:var(--rl);padding:14px 16px;margin-bottom:10px">
+  // ESPN auto-fetch detects parlay date and fetches correct day's scores
+  const allUnlogged = [...pending, ...pastPending];
+  const fetchBtn = allUnlogged.length ? `<div style="background:var(--ink2);border:1px solid var(--line);border-radius:var(--rl);padding:14px 16px;margin-bottom:10px">
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;flex-wrap:wrap;gap:8px">
-      <span style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.07em;color:var(--fg3)">Pending (${pending.length})</span>
+      <span style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.07em;color:var(--fg3)">Pending (${allUnlogged.length})</span>
       <button class="fetch-btn" style="width:auto;padding:5px 12px;font-size:11px" onclick="autoEvalResults()">
         &#8635; Auto-fetch from ESPN
       </button>
     </div>
-    ${pending.map(p => `<div class="rrow">
+    ${allUnlogged.map(p => `<div class="rrow">
       <div class="rinfo">
         <div class="rname">
           <span class="pbadge ${TBC[p.tier]||'pb-grind'}">${p.tier}</span>
