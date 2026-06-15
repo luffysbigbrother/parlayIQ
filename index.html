@@ -256,6 +256,31 @@ select option{background:var(--ink2)}
 .survival-good{color:var(--green-l)}
 .survival-ok{color:var(--amber-l)}
 .survival-hard{color:var(--red-l)}
+/* Contrarian flag */
+.contrarian-btn{background:none;border:1px solid var(--line);color:var(--fg3);cursor:pointer;padding:2px 8px;border-radius:4px;font-size:10px;font-weight:600;font-family:var(--font);transition:all .12s}
+.contrarian-btn:hover{border-color:var(--line2);color:var(--fg2);background:var(--ink3)}
+.contrarian-btn.on{background:var(--purple-x);border-color:rgba(124,58,237,.4);color:var(--purple-l)}
+.contrarian-btn:focus-visible{outline:2px solid var(--blue-l);outline-offset:2px}
+/* Daily stake recommendation */
+.stake-rec{background:var(--ink2);border:1px solid var(--line);border-radius:var(--rl);padding:10px 14px;margin-bottom:12px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px}
+.stake-rec-label{font-size:11px;color:var(--fg3)}
+.stake-rec-val{font-size:14px;font-weight:700;font-family:var(--mono);color:var(--gold-l)}
+/* Calibration curve */
+.cal-curve-row{display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:0.5px solid var(--line);font-size:11px}
+.cal-curve-row:last-child{border-bottom:none}
+.cal-tier-label{min-width:90px;font-weight:500}
+.cal-bar-wrap{flex:1;position:relative;height:6px;background:var(--ink4);border-radius:3px}
+.cal-expected{position:absolute;top:0;height:100%;background:var(--fg3);opacity:.4;border-radius:3px}
+.cal-observed{position:absolute;top:0;height:100%;border-radius:3px}
+.cal-verdict{font-size:10px;min-width:90px;text-align:right}
+.cv-calibrated{color:var(--green-l)}
+.cv-over{color:var(--red-l)}
+.cv-under{color:var(--amber-l)}
+.cv-nodata{color:var(--fg3)}
+/* Credibility dots */
+.cred-dots{display:inline-flex;gap:2px;margin-left:4px}
+.cred-dot{width:5px;height:5px;border-radius:50%;background:var(--fg3)}
+.cred-dot.filled{background:var(--blue-l)}
 /* Hedge leg indicator */
 .lp-hedge{opacity:.7;font-style:italic}
 /* Game type pills */
@@ -357,6 +382,10 @@ select option{background:var(--ink2)}
         <div class="field"><label>Max legs (lottery)</label><input type="number" id="tLegs" value="15" min="5" max="20"/></div>
       </div>
       <div class="gen-note">Splits distribute automatically. Overlap caps calculated from tier + history.</div>
+      <div class="stake-rec" id="stakeRec" style="display:none">
+        <span class="stake-rec-label">Ed Thorp daily stake recommendation</span>
+        <span class="stake-rec-val" id="stakeRecVal">$20</span>
+      </div>
       <button class="gen-btn" id="genBtn" onclick="generateParlays()">&#9889; Generate parlays</button>
     </div>
   </div>
@@ -606,13 +635,14 @@ const Store = (() => {
   const KEY      = 'parlayiq_v6';
   const GIST_KEY = 'parlayiq_gist';
   const def = () => ({
-    games:   [],   // today's slate
-    picks:   {},   // gameId -> pick object
-    parlays: [],   // generated parlays
-    results: [],   // logged outcomes
-    teamLog: {},   // team -> { wins, losses, pushes, tierCounts: {} }
-    tierLog: {},   // tier -> { wins, losses }
-    splitLog:{},   // team -> { dogWins, dogLosses, moneyWins, moneyLosses }
+    games:        [],  // today's slate
+    picks:        {},  // gameId -> pick object
+    parlays:      [],  // generated parlays
+    results:      [],  // logged outcomes
+    teamLog:      {},  // team -> { wins, losses, pushes }
+    tierLog:      {},  // tier -> { wins, losses }
+    splitLog:     {},  // team -> { dogWins, dogLosses, moneyWins, moneyLosses }
+    contraryLog:  {},  // team -> { wins, losses } for contrarian picks only
   });
   const load = () => { try { return { ...def(), ...JSON.parse(localStorage.getItem(KEY)) }; } catch { return def(); } };
   const save = s => localStorage.setItem(KEY, JSON.stringify(s));
@@ -1017,9 +1047,57 @@ const Optimizer = (() => {
   // Used for Shannon uniqueness enforcement across parlays.
   const fingerprint = legs => legs.map(l => l.team).sort().join('|');
 
-  // Parlay survival score: joint probability all legs win.
-  const survivalScore = legs =>
-    legs.reduce((p, l) => p * Edge.sc(l.team, l.confidence, l.isDog || false), 1);
+  // Tom Tango: series correlation discount.
+  // Detects when two legs in the same parlay come from the same
+  // MLB series — same opponent teams playing each other within
+  // a 3-day window. These legs are NOT independent:
+  // momentum, bullpen availability, and offensive form carry
+  // across games. Treating them as independent overstates
+  // the joint survival probability.
+  //
+  // Detection: leg A and leg B share a series if the game
+  // records show they involve the same two teams (either order)
+  // within 3 days. Each correlated pair gets a 0.85× multiplier
+  // on their joint probability contribution.
+  //
+  // Example: Cubs Lock on Friday + Cubs Need Win Saturday
+  // against the Cardinals both days = correlated legs.
+  // Cubs + Mets on separate games = independent, no discount.
+  const seriesCorrelationDiscount = (legs) => {
+    const games = Store.get('games');
+
+    // Build a map of gameId → { awayTeam, homeTeam } for each leg
+    const legGames = legs.map(l => {
+      const g = games.find(g => g.id === l.gameId ||
+        g.awayTeam === l.team || g.homeTeam === l.team);
+      if (!g) return null;
+      // Canonical pair: sorted team names so order doesn't matter
+      return { team: l.team, pair: [g.awayTeam, g.homeTeam].sort().join('|') };
+    }).filter(Boolean);
+
+    // Count correlated pairs — legs sharing the same team pair
+    const pairCounts = {};
+    legGames.forEach(lg => {
+      pairCounts[lg.pair] = (pairCounts[lg.pair] || 0) + 1;
+    });
+
+    // Each series with 2+ legs contributes one correlated pair
+    // Apply 0.85× per correlated pair, floor at 0.60
+    let discount = 1.0;
+    Object.values(pairCounts).forEach(count => {
+      if (count >= 2) discount *= 0.85;
+    });
+    return Math.max(0.60, discount);
+  };
+
+  // Parlay survival score with Tango series correlation discount.
+  // Raw = joint probability assuming independence.
+  // Adjusted = raw × discount for correlated series legs.
+  const survivalScore = legs => {
+    const raw      = legs.reduce((p, l) => p * Edge.sc(l.team, l.confidence, l.isDog || false), 1);
+    const discount = seriesCorrelationDiscount(legs);
+    return raw * discount;
+  };
 
   // ── Hedge builder ────────────────────────
 
@@ -1465,23 +1543,67 @@ const ResultsEngine = (() => {
 // ═══════════════════════════════════════════
 // CALIBRATION ENGINE
 // Derives win rates from logged results.
+// Nate Silver: calibration curve per tier.
+// Bill James:  game type performance tracking.
 // ═══════════════════════════════════════════
 const Cal = (() => {
   const compute = () => {
-    const byTeam = {}, byTier = {}, byPocket = {};
+    const byTeam = {}, byTier = {}, byPocket = {}, byGameType = {};
     Store.get('results').forEach(r => r.legResults.forEach(lr => {
-      const k = lr.pocket || 'unknown';
+      const k  = lr.pocket    || 'unknown';
+      const gt = lr.gameType  || 'unknown';
       if (!byTeam[lr.team])       byTeam[lr.team]       = { w:0, l:0, p:0 };
       if (!byTier[lr.confidence]) byTier[lr.confidence] = { w:0, l:0, p:0 };
       if (!byPocket[k])           byPocket[k]            = { w:0, l:0, p:0 };
-      if (lr.outcome === 'win')   { byTeam[lr.team].w++;  byTier[lr.confidence].w++; byPocket[k].w++; }
-      if (lr.outcome === 'loss')  { byTeam[lr.team].l++;  byTier[lr.confidence].l++; byPocket[k].l++; }
-      if (lr.outcome === 'push')  { byTeam[lr.team].p++;  byTier[lr.confidence].p++; byPocket[k].p++; }
+      if (!byGameType[gt])        byGameType[gt]         = { w:0, l:0, p:0 };
+      if (lr.outcome === 'win')  {
+        byTeam[lr.team].w++; byTier[lr.confidence].w++;
+        byPocket[k].w++;     byGameType[gt].w++;
+      }
+      if (lr.outcome === 'loss') {
+        byTeam[lr.team].l++; byTier[lr.confidence].l++;
+        byPocket[k].l++;     byGameType[gt].l++;
+      }
+      if (lr.outcome === 'push') {
+        byTeam[lr.team].p++; byTier[lr.confidence].p++;
+        byPocket[k].p++;     byGameType[gt].p++;
+      }
     }));
-    return { byTeam, byTier, byPocket };
+    return { byTeam, byTier, byPocket, byGameType };
   };
+
   const wr = rec => { const t = rec.w + rec.l; return t < 1 ? null : rec.w / t; };
-  return { compute, wr };
+
+  // Nate Silver: calibration score per tier.
+  // Returns { expected, observed, gap, verdict }
+  // gap > 0 = overconfident, gap < 0 = underconfident
+  const calibrationScore = (tierKey, byTier) => {
+    const tier = TierEngine.get(tierKey);
+    const expected = tier.confidence; // actuarial prior
+    const rec = byTier[tierKey];
+    if (!rec || (rec.w + rec.l) < 5) return null;
+    const observed = rec.w / (rec.w + rec.l);
+    const gap      = expected - observed; // positive = overconfident
+    const verdict  = Math.abs(gap) < 0.05 ? 'calibrated'
+                   : gap > 0 ? 'overconfident' : 'underconfident';
+    return { expected, observed, gap, verdict, n: rec.w + rec.l };
+  };
+
+  // Bill James: game type cap modifier.
+  // DIV reads better → higher cap modifier.
+  // ILEX reads worse → lower cap modifier.
+  const gameTypeModifier = (gameType, byGameType) => {
+    const rec = byGameType[gameType];
+    if (!rec || (rec.w + rec.l) < 5) return 1.0; // no data — no adjustment
+    const wr = rec.w / (rec.w + rec.l);
+    if (wr >= 0.65) return 1.20; // strong in this game type — boost 20%
+    if (wr >= 0.55) return 1.10; // above average — boost 10%
+    if (wr >= 0.45) return 1.00; // average — no change
+    if (wr >= 0.35) return 0.85; // below average — reduce 15%
+    return 0.70;                  // poor — reduce 30%
+  };
+
+  return { compute, wr, calibrationScore, gameTypeModifier };
 })();
 
 // ═══════════════════════════════════════════
@@ -1622,6 +1744,12 @@ const renderSlate = () => {
       </div>
       <div class="gc-conf" role="group" aria-label="Confidence tier">${confBtns}</div>
       ${splitQualityToggle}
+      ${pk.side ? `<div style="padding:0 12px 10px;display:flex;align-items:center;gap:8px">
+        <button class="contrarian-btn${pk.contrarian?' on':''}" onclick="setContrarian('${g.id}')" aria-pressed="${!!pk.contrarian}">
+          ${pk.contrarian?'&#128307; Fading market':'&#9898; Fading market'}
+        </button>
+        ${pk.contrarian?'<span style="font-size:10px;color:var(--purple-l)">Contrarian pick — tracked separately</span>':''}
+      </div>` : ''}
       ${(() => {
         const aCtx = Validation.recentContext(g.awayTeam);
         const hCtx = pk.side ? Validation.recentContext(pk.side==='away'?g.awayTeam:g.homeTeam) : [];
@@ -1695,6 +1823,20 @@ const renderParlays = (parlays, picks) => {
             <span class="pc-edge">edge ${Math.round(p.edgeScore*100)}%</span>
             <span class="survival ${p.survivalScore>=0.05?'survival-good':p.survivalScore>=0.01?'survival-ok':'survival-hard'}">
               survival ${(p.survivalScore*100).toFixed(1)}%
+              <span class="cred-dots" title="Credibility: how much history backs this score">
+                ${(() => {
+                  // Average credibility across legs
+                  const avgZ = p.legs.reduce((s,l) => {
+                    const log = Store.get('teamLog')[l.team];
+                    const n = log ? (log.wins+log.losses) : 0;
+                    return s + TierEngine.credibility(n);
+                  }, 0) / (p.legs.length || 1);
+                  const filled = Math.round(avgZ * 5);
+                  return Array.from({length:5},(_,i) =>
+                    `<span class="cred-dot${i<filled?' filled':''}"></span>`
+                  ).join('');
+                })()}
+              </span>
             </span>
           </div>
         </div>
@@ -1945,8 +2087,61 @@ const renderStats = () => {
     <div class="twrap"><table class="caltable">${th}${rows||`<tr><td colspan="4" style="color:var(--fg3);padding:10px">${empty}</td></tr>`}</table></div>
   </div>`;
 
-  el.innerHTML = prog + hero + tierStatus
+  // Nate Silver: calibration curve
+  const calCurveRows = TierEngine.CONF_KEYS.filter(k => k !== 'avoid' && k !== 'split').map(k => {
+    const cs   = Cal.calibrationScore(k, cal.byTier);
+    const tier = TierEngine.get(k);
+    if (!cs) return `<div class="cal-curve-row">
+      <span class="cal-tier-label" style="color:${tier.color}">${tier.label}</span>
+      <div class="cal-bar-wrap"><div class="cal-expected" style="width:${Math.round(tier.confidence*100)}%"></div></div>
+      <span class="cal-verdict cv-nodata">Need ${5} results</span>
+    </div>`;
+    const expPct = Math.round(cs.expected * 100);
+    const obsPct = Math.round(cs.observed * 100);
+    const obsColor = cs.verdict==='calibrated'?'var(--green-l)':cs.verdict==='overconfident'?'var(--red-l)':'var(--amber-l)';
+    const gapLabel = cs.verdict==='calibrated'?'Calibrated ✓'
+      : cs.verdict==='overconfident'?`Overconfident +${Math.round(cs.gap*100)}pts`
+      : `Underconfident ${Math.round(cs.gap*100)}pts`;
+    return `<div class="cal-curve-row">
+      <span class="cal-tier-label" style="color:${tier.color}">${tier.label}</span>
+      <div class="cal-bar-wrap" title="Grey=${expPct}% expected, Color=${obsPct}% observed">
+        <div class="cal-expected" style="width:${expPct}%"></div>
+        <div class="cal-observed" style="width:${obsPct}%;background:${obsColor}"></div>
+      </div>
+      <span class="cal-verdict ${cs.verdict==='calibrated'?'cv-calibrated':cs.verdict==='overconfident'?'cv-over':'cv-under'}">${gapLabel}</span>
+    </div>`;
+  }).join('');
+
+  const calCurve = `<div style="background:var(--ink2);border:1px solid var(--line);border-radius:var(--rl);padding:14px 16px;margin-bottom:10px">
+    <div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.07em;color:var(--fg3);margin-bottom:10px">
+      Calibration curve — expected vs actual hit rate
+    </div>
+    ${calCurveRows}
+  </div>`;
+
+  // Bill James: game type breakdown
+  const gtOrder = ['div','lgue','ilex'];
+  const gtLabel = { div:'Division', lgue:'Same League', ilex:'Interleague' };
+  const gtRows = gtOrder.map(gt => {
+    const r = cal.byGameType[gt];
+    if (!r || (r.w+r.l) < 1) return '';
+    return `<tr><td>${gtLabel[gt]||gt}</td><td style="font-family:var(--mono)">${r.w}</td><td style="font-family:var(--mono)">${r.l}</td><td>${UI.wrBar(Cal.wr(r))}</td></tr>`;
+  }).join('');
+
+  // Billy Beane: contrarian performance
+  const contraryLog = Store.get('contraryLog') || {};
+  const contraryRows = Object.entries(contraryLog)
+    .filter(([,r]) => r.wins + r.losses > 0)
+    .sort((a,b) => (b[1].wins+b[1].losses)-(a[1].wins+a[1].losses))
+    .map(([team,r]) => {
+      const w = r.wins/(r.wins+r.losses);
+      return `<tr><td>${esc(team)}</td><td style="font-family:var(--mono)">${r.wins}</td><td style="font-family:var(--mono)">${r.losses}</td><td>${UI.wrBar(w)}</td></tr>`;
+    }).join('');
+
+  el.innerHTML = prog + hero + calCurve + tierStatus
     + tcard('By tier', tierRows, 'No data')
+    + (gtRows ? tcard('By game type — Bill James', gtRows, 'No data') : '')
+    + (contraryRows ? tcard('Contrarian picks — Billy Beane', contraryRows, 'No data') : '')
     + tcard('By team', teamRows, 'No data')
     + tcard('By time pocket', pkRows, 'No data');
 };
@@ -2042,6 +2237,7 @@ const togglePick = (gameId, side) => {
         isDog:        game.dog === side,
         confidence:   cur?.confidence || 'need',
         splitQuality: cur?.splitQuality || 'quality',
+        contrarian:   cur?.contrarian  || false,
         gameTime:     game.gameTime,
         pocket:       UI.pocket(game.gameTime),
       },
@@ -2062,6 +2258,15 @@ const setConf = (gameId, conf) => {
   Store.upd('picks', picks => ({
     ...picks,
     [gameId]: { ...picks[gameId], confidence: conf },
+  }));
+  renderSlate();
+};
+
+// Billy Beane: toggle contrarian flag — fading the public/market
+const setContrarian = (gameId) => {
+  Store.upd('picks', picks => ({
+    ...picks,
+    [gameId]: { ...picks[gameId], contrarian: !picks[gameId]?.contrarian },
   }));
   renderSlate();
 };
@@ -2092,6 +2297,19 @@ const generateParlays = () => {
   const parlays = Optimizer.build(picks, opts).map(p => ({ ...p, date: new Date().toISOString() }));
   Store.set('parlays', parlays);
   renderParlays(parlays, picks);
+
+  // Ed Thorp: daily stake recommendation from portfolio Kelly edge sum
+  const kellySum = picks.reduce((s, p) =>
+    s + Edge.kellyFraction(p.team, p.confidence, p.isDog || false), 0);
+  // Scale to $10-$50 range relative to kelly sum
+  const suggested = Math.min(50, Math.max(10, Math.round(kellySum * 40)));
+  const recEl = document.getElementById('stakeRec');
+  const valEl = document.getElementById('stakeRecVal');
+  if (recEl && valEl) {
+    valEl.textContent = `$${suggested}`;
+    recEl.style.display = 'flex';
+  }
+
   switchTab('parlays');
   UI.toast(`&#10003; ${parlays.length} parlays ready`);
   if (Gist.isConfigured()) Gist.push();
@@ -2105,15 +2323,20 @@ const logResult = (parlayId, outcome) => {
     parlayId,
     outcome,
     date:       new Date().toISOString(),
-    legResults: parlay.legs.map(l => ({
-      team:       l.team,
-      confidence: l.confidence,
-      pocket:     l.pocket || UI.pocket(l.gameTime || ''),
-      isDog:      l.isDog,
-      // v1: parlay outcome proxies leg outcome — intentionally coarse.
-      // Future: per-leg result logging for sharper calibration.
-      outcome,
-    })),
+    legResults: parlay.legs.map(l => {
+      const game     = Store.get('games').find(g => g.awayTeam === l.team || g.homeTeam === l.team);
+      const gameType = game ? MLBMap.classify(game.awayTeam, game.homeTeam).type : 'unknown';
+      return {
+        team:       l.team,
+        confidence: l.confidence,
+        pocket:     l.pocket || UI.pocket(l.gameTime || ''),
+        isDog:      l.isDog,
+        contrarian: l.contrarian || false,
+        gameType,
+        // v1: parlay outcome proxies leg outcome — intentionally coarse.
+        outcome,
+      };
+    }),
   }]);
 
   // Update team, tier, and split logs
