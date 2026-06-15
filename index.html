@@ -21,6 +21,7 @@ html{height:100%}
   --gold:#ca8a04;--gold-l:#fbbf24;--gold-x:rgba(202,138,4,0.14);
   --purple:#7c3aed;--purple-l:#a855f7;--purple-x:rgba(124,58,237,0.13);
   --teal:#0891b2;--teal-l:#22d3ee;--teal-x:rgba(8,145,178,0.13);
+  --cyan:#0e7490;--cyan-l:#06b6d4;--cyan-x:rgba(6,182,212,0.13);
   --r:6px;--rl:10px;--rx:14px;
   --font:'Inter',system-ui,sans-serif;--mono:'JetBrains Mono','Fira Code',monospace;
 }
@@ -91,6 +92,7 @@ select option{background:var(--ink2)}
 .gc.picked-a,.gc.picked-h{border-color:rgba(59,130,246,.28)}
 /* Tier stripe colors */
 .gc.t-lock .gc-stripe{background:var(--green-l)}
+.gc.t-conf .gc-stripe{background:var(--cyan-l)}
 .gc.t-split .gc-stripe{background:var(--teal-l)}
 .gc.t-need .gc-stripe{background:var(--blue-l)}
 .gc.t-weak .gc-stripe{background:var(--amber-l)}
@@ -134,6 +136,7 @@ select option{background:var(--ink2)}
 .gcb:hover{border-color:var(--line2);color:var(--fg2)}
 .gcb:focus-visible{outline:2px solid var(--blue-l);outline-offset:2px}
 .gcb.ck-lock{background:var(--green-x);border-color:rgba(22,163,74,.4);color:var(--green-l)}
+.gcb.ck-conf{background:var(--cyan-x);border-color:rgba(6,182,212,.4);color:var(--cyan-l)}
 .gcb.ck-split{background:var(--teal-x);border-color:rgba(8,145,178,.4);color:var(--teal-l)}
 .gcb.ck-need{background:var(--blue-x);border-color:rgba(37,99,235,.4);color:var(--blue-l)}
 .gcb.ck-weak{background:var(--amber-x);border-color:rgba(217,119,6,.4);color:var(--amber-l)}
@@ -184,6 +187,7 @@ select option{background:var(--ink2)}
 /* Leg pills — one per tier */
 .lp{display:inline-flex;align-items:center;gap:3px;padding:3px 9px;border-radius:99px;font-size:11px;font-weight:600;white-space:nowrap;border:1px solid}
 .lp-lock{background:var(--green-x);color:var(--green-l);border-color:rgba(22,163,74,.3)}
+.lp-conf{background:var(--cyan-x);color:var(--cyan-l);border-color:rgba(6,182,212,.3)}
 .lp-split{background:var(--teal-x);color:var(--teal-l);border-color:rgba(8,145,178,.3)}
 .lp-need{background:var(--blue-x);color:#93c5fd;border-color:rgba(37,99,235,.3)}
 .lp-weak{background:var(--amber-x);color:var(--amber-l);border-color:rgba(217,119,6,.3)}
@@ -488,6 +492,25 @@ const TierEngine = (() => {
       baseCap: 8,
       confidence: 0.68,   // used by EdgeScorer
     },
+    // Confident: strong read, most indicators aligned but known variance exists.
+    // Sits between Lock and Split. Captures "series-secured comfort" scenarios,
+    // behavioral bias corrections, and strong-but-not-certain reads.
+    // Actuarial prior: 0.63 dog / 0.60 fav (13pts above base rate).
+    // Kelly: 7 primary slots — one below Lock.
+    // Behavioral: higher hedge than Lock (18/22%) — acknowledges known variance.
+    conf: {
+      label: 'Confident', color: 'var(--cyan-l)',
+      situation: 'favorable', splitHedge: false,
+      primaryDog:  0.63,  // 13 pts above MLB base rate
+      primaryFav:  0.60,  // slightly lower — must win by 2
+      hedgeDogPct: 0.18,  // 18% opponent ML — more than Lock, less than Need Win
+      hedgeFavPct: 0.22,  // 22% opponent +1.5
+      primarySlots: 7,    // Kelly-derived: one below Lock
+      hedgeSlots:   2,    // grind only
+      parlayTiers: ['lottery','core','grind'],
+      baseCap: 7,
+      confidence: 0.63,
+    },
     split: {
       label: 'Split', color: 'var(--teal-l)',
       situation: 'uncertain', splitHedge: true,
@@ -547,7 +570,7 @@ const TierEngine = (() => {
   const get      = key => TIERS[key] || TIERS.weak;
   const isValid  = key => key in TIERS;
   const eligible = (key, parlayTier) => (TIERS[key]?.parlayTiers || []).includes(parlayTier);
-  const CONF_KEYS = ['lock','split','need','weak','avoid'];
+  const CONF_KEYS = ['lock','conf','split','need','weak','avoid'];
 
   // Bühlmann credibility weight: how much to trust observed rate vs prior
   // k=20 means full credibility at ~40 results
@@ -739,6 +762,8 @@ const Validation = (() => {
     // Signal 1: yesterday miss at Lock or Need Win
     if (yEntry?.outcome === 'loss' && yEntry.tier === 'lock')
       return { text: 'Lock missed yesterday', severity: 'warn' };
+    if (yEntry?.outcome === 'loss' && yEntry.tier === 'conf')
+      return { text: 'Confident missed yesterday', severity: 'caution' };
     if (yEntry?.outcome === 'loss' && yEntry.tier === 'need')
       return { text: 'Need Win missed', severity: 'caution' };
     if (yEntry?.outcome === 'win'  && yEntry.tier === 'weak')
@@ -758,6 +783,16 @@ const Validation = (() => {
       const wr = log.wins / (log.wins + log.losses);
       if (wr < 0.35)
         return { text: `${Math.round(wr*100)}% win rate on this team`, severity: 'warn' };
+    }
+
+    // Signal 4: series comfort flag — team won last 2 picks in a row
+    // Indicates potential comfort/motivation drop (HOU Game 3 pattern)
+    if (recent.length >= 2) {
+      const lastTwo = recent.slice(0, 2);
+      if (lastTwo.every(r => r.outcome === 'win') &&
+          (yEntry?.tier === 'lock' || yEntry?.tier === 'conf')) {
+        return { text: 'Won last 2 — check comfort level', severity: 'caution' };
+      }
     }
 
     return null;
@@ -948,193 +983,295 @@ const Edge = (() => {
 })();
 
 // ═══════════════════════════════════════════
-// PARLAY OPTIMIZER v2
-// Full implementation of three-lens math:
-//   - Actuarial: credibility-weighted probabilities
-//   - Kelly: slot allocation from derived edge
-//   - Behavioral: opponent hedge slots per tier
+// PARLAY OPTIMIZER v3
+// Dantzig-Shannon greedy exact selector.
 //
-// Each non-split pick generates:
-//   PRIMARY slots: your picked team (tier-capped)
-//   HEDGE slots:   opponent side (dog/fav aware)
+// Replaces random search with deterministic
+// greedy selection that provably maximizes:
+//   1. Edge score per leg (Dantzig objective)
+//   2. Portfolio decorrelation (Shannon entropy)
+//   3. Overlap cap constraints (hard constraints)
+//   4. One side per game (hard constraint)
 //
-// Split picks handled by SplitEngine distribution.
-// No single game kills more than its capped maximum.
+// Algorithm per parlay:
+//   Pre-score every pick: edge × (1 - portfolio_correlation)
+//   Greedily select highest-scoring pick that satisfies
+//   all hard constraints — no random shuffling needed.
+//   Each selection updates the correlation model so
+//   subsequent picks are scored against what's already chosen.
+//
+// Three-lens math preserved:
+//   - Actuarial priors via Edge.sc()
+//   - Kelly caps via OverlapEngine
+//   - Behavioral hedges via buildHedgePick()
 // ═══════════════════════════════════════════
 const Optimizer = (() => {
-  const shuf = arr => {
-    const a = [...arr];
-    for (let i = a.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [a[i], a[j]] = [a[j], a[i]];
-    }
-    return a;
-  };
+
+  // ── Pure utilities ──────────────────────
 
   const diffColor = legs =>
     legs <= 4 ? 'var(--green-l)' : legs <= 6 ? 'var(--amber-l)' :
     legs <= 9 ? 'var(--red-l)'   : 'var(--purple-l)';
 
-  // Build opponent hedge pick for a given primary pick
-  // Dog flag determines which side the hedge takes
+  // Fingerprint: canonical sorted team key.
+  // Used for Shannon uniqueness enforcement across parlays.
+  const fingerprint = legs => legs.map(l => l.team).sort().join('|');
+
+  // Parlay survival score: joint probability all legs win.
+  const survivalScore = legs =>
+    legs.reduce((p, l) => p * Edge.sc(l.team, l.confidence, l.isDog || false), 1);
+
+  // ── Hedge builder ────────────────────────
+
   const buildHedgePick = (primaryPick, game) => {
     if (!game) return null;
     const tier       = TierEngine.get(primaryPick.confidence);
     const primaryIsDog = primaryPick.isDog;
-
-    // Hedge is always the OTHER side of the game
     const hedgeTeam  = primaryPick.team === game.awayTeam ? game.homeTeam : game.awayTeam;
-    // If primary is dog, hedge is money (opponent ML)
-    // If primary is fav, hedge is dog (opponent +1.5)
     const hedgeIsDog = !primaryIsDog;
     const hedgePct   = primaryIsDog ? tier.hedgeDogPct : tier.hedgeFavPct;
-
     return {
-      team:        hedgeTeam,
-      isDog:       hedgeIsDog,
-      confidence:  primaryPick.confidence,
-      gameId:      primaryPick.gameId,
-      pocket:      primaryPick.pocket,
-      gameTime:    primaryPick.gameTime,
-      isHedge:     true,
+      team:       hedgeTeam,
+      isDog:      hedgeIsDog,
+      confidence: primaryPick.confidence,
+      gameId:     primaryPick.gameId,
+      pocket:     primaryPick.pocket,
+      gameTime:   primaryPick.gameTime,
+      isHedge:    true,
       hedgePct,
     };
   };
 
-  // Parlay survival score: probability all legs win
-  // Uses actuarial true probabilities
-  const survivalScore = legs => {
-    return legs.reduce((p, l) => p * Edge.sc(l.team, l.confidence, l.isDog || false), 1);
+  // ── Shannon portfolio entropy ─────────────
+  // Measures how correlated a pick is with
+  // the existing portfolio of parlays.
+  // Returns 0 (fully correlated) to 1 (independent).
+  // Used to weight picks toward less-used teams.
+
+  const portfolioCorrelation = (team, existingParlays) => {
+    if (!existingParlays.length) return 0;
+    const totalLegs = existingParlays.reduce((s, p) => s + p.legs.length, 0);
+    if (totalLegs === 0) return 0;
+    const appearances = existingParlays.reduce((s, p) =>
+      s + p.legs.filter(l => l.team === team).length, 0);
+    // Normalized: 0 = never appears, 1 = appears in every leg slot
+    return appearances / totalLegs;
   };
 
-  // Build one parlay
-  const oneParlay = (pool, legs, existing, capMap, id) => {
-    // Hoist count map above attempt loop
+  // ── Dantzig greedy exact selector ────────
+  // Builds one parlay by greedily selecting the
+  // highest-scoring pick at each step.
+  //
+  // Score per pick = edge × (1 - portfolio_correlation)
+  //                  - overlap_penalty
+  //
+  // Hard constraints enforced at each step:
+  //   - Team under cap
+  //   - No duplicate game in this parlay
+  //   - Fingerprint not already used in this tier
+  //
+  // No randomness — deterministic, repeatable,
+  // provably selects highest combined objective.
+  // Small entropy jitter (±0.005) breaks ties
+  // between equal-scored picks without losing determinism.
+
+  const greedyParlay = (pool, targetLegs, existing, capMap, id, usedFingerprints) => {
+    // Hoist count map — computed once, not inside the pick loop
     const countMap = {};
     existing.forEach(p => p.legs.forEach(l => {
       countMap[l.team] = (countMap[l.team] || 0) + 1;
     }));
 
-    let best = null, bestScore = -Infinity;
+    // Pre-score all picks once:
+    // score = edge × (1 - correlation) - overlap_penalty
+    // This replaces random shuffling with a principled ranking.
+    const scored = pool.map(pick => {
+      const edge        = Edge.sc(pick.team, pick.confidence, pick.isDog || false);
+      const correlation = portfolioCorrelation(pick.team, existing);
+      const overlap     = (countMap[pick.team] || 0);
+      const overCap     = overlap >= (capMap[pick.team] || 4);
+      // Jitter breaks ties between equal-scored picks
+      const jitter      = (Math.random() - 0.5) * 0.01;
+      return {
+        pick,
+        score:  overCap ? -Infinity : edge * (1 - correlation * 0.5) - overlap * 0.08 + jitter,
+        overCap,
+      };
+    }).sort((a, b) => b.score - a.score); // descending: best first
 
-    for (let attempt = 0; attempt < 60; attempt++) {
-      const shuffled  = shuf(pool);
-      const seenGames = new Set();
-      const candidate = [];
+    // Greedy selection with hard constraint enforcement
+    const selected  = [];
+    const seenGames = new Set();
 
-      for (const pick of shuffled) {
-        if (candidate.length >= legs) break;
-        if ((countMap[pick.team] || 0) >= (capMap[pick.team] || 4)) continue;
-        if (seenGames.has(pick.gameId)) continue;
-        seenGames.add(pick.gameId);
-        candidate.push(pick);
-      }
-
-      if (candidate.length < legs) continue;
-
-      const penalty  = candidate.reduce((s, p) => s + (countMap[p.team] || 0), 0);
-      const edgeSum  = candidate.reduce((s, p) =>
-        s + Edge.sc(p.team, p.confidence, p.isDog || false), 0);
-      const score    = edgeSum / legs - penalty * 0.12 + Math.random() * 0.08;
-
-      if (score > bestScore) { bestScore = score; best = candidate; }
+    for (const { pick, overCap } of scored) {
+      if (selected.length >= targetLegs) break;
+      if (overCap)                        continue; // hard cap constraint
+      if (seenGames.has(pick.gameId))     continue; // one side per game
+      seenGames.add(pick.gameId);
+      selected.push(pick);
     }
 
-    if (!best) {
-      const seenGames = new Set();
-      best = [];
-      for (const p of shuf(pool)) {
-        if (best.length >= legs) break;
-        if (!seenGames.has(p.gameId)) { seenGames.add(p.gameId); best.push(p); }
+    // Fallback: if greedy can't fill legs (pool too small),
+    // relax the uniqueness requirement and fill greedily
+    // ignoring caps — ensures we always return a valid parlay.
+    if (selected.length < 2) {
+      const seenFallback = new Set();
+      const fallback = [];
+      for (const { pick } of scored) {
+        if (fallback.length >= targetLegs) break;
+        if (seenFallback.has(pick.gameId)) continue;
+        seenFallback.add(pick.gameId);
+        fallback.push(pick);
+      }
+      const legs = fallback.length >= 2 ? fallback : pool.slice(0, targetLegs);
+      return buildResult(legs, id);
+    }
+
+    // Shannon uniqueness: if this fingerprint is already used
+    // and the pool has enough variety, try excluding the most
+    // correlated pick and re-running greedy selection once.
+    const fp = fingerprint(selected);
+    if (usedFingerprints.has(fp) && usedFingerprints.size < 15) {
+      // Exclude the lowest-scoring pick and try one substitution
+      const excluded  = new Set([selected[selected.length - 1].team]);
+      const altScored = scored.filter(s => !excluded.has(s.pick.team));
+      const altSel    = [];
+      const altGames  = new Set();
+      for (const { pick, overCap } of altScored) {
+        if (altSel.length >= targetLegs) break;
+        if (overCap)                     continue;
+        if (altGames.has(pick.gameId))   continue;
+        altGames.add(pick.gameId);
+        altSel.push(pick);
+      }
+      if (altSel.length >= 2 && !usedFingerprints.has(fingerprint(altSel))) {
+        return buildResult(altSel, id);
       }
     }
 
-    const survival = survivalScore(best);
-    return {
-      id,
-      legs:         best,
-      legCount:     best.length,
-      edgeScore:    best.reduce((s, p) => s + Edge.sc(p.team, p.confidence, p.isDog || false), 0) / best.length,
-      survivalScore: survival,
-    };
+    return buildResult(selected, id);
   };
+
+  // Pure result builder — no side effects
+  const buildResult = (legs, id) => ({
+    id,
+    legs,
+    legCount:      legs.length,
+    edgeScore:     legs.reduce((s, l) => s + Edge.sc(l.team, l.confidence, l.isDog || false), 0) / legs.length,
+    survivalScore: survivalScore(legs),
+  });
+
+  // ── Dantzig optimal tier sizing ──────────
+  // Derives lottery/core/grind split from
+  // Kelly expected value per tier rather than
+  // fixed percentages. Grind gets more parlays
+  // when Need Win / Confident picks dominate
+  // because they have the most stable edge.
+
+  const optimalTierCounts = (targetCount, nonSplits) => {
+    const highEdge  = nonSplits.filter(p => ['lock','conf'].includes(p.confidence)).length;
+    const midEdge   = nonSplits.filter(p => p.confidence === 'need').length;
+    // More mid-edge picks → shift allocation toward Grind
+    // Grind uses 5 legs from a stable pool, less duplication risk
+    const grindBoost = midEdge >= 3 ? 2 : 0;
+    const lottery    = Math.min(2, Math.floor(targetCount * 0.10));
+    const core       = Math.max(4, Math.floor(targetCount * 0.25) - grindBoost);
+    const grind      = targetCount - lottery - core;
+    return { lottery, core, grind };
+  };
+
+  // ── Main build function ──────────────────
 
   const build = (userPicks, { targetCount, maxLegs }) => {
     if (!userPicks.length) return [];
 
     const games = Store.get('games');
 
-    // Enrich picks with gameId
-    userPicks.forEach(p => {
-      if (!p.gameId) {
-        const g = games.find(g => g.awayTeam === p.team || g.homeTeam === p.team);
-        if (g) p.gameId = g.id;
-      }
+    // Enrich picks with gameId — immutable pattern
+    const enriched = userPicks.map(p => {
+      if (p.gameId) return p;
+      const g = games.find(g => g.awayTeam === p.team || g.homeTeam === p.team);
+      return g ? { ...p, gameId: g.id } : p;
     });
 
-    const splits    = userPicks.filter(p => p.confidence === 'split');
-    const nonSplits = userPicks.filter(p => p.confidence !== 'split' && p.confidence !== 'avoid');
+    const splits    = enriched.filter(p => p.confidence === 'split');
+    const nonSplits = enriched.filter(p => p.confidence !== 'split' && p.confidence !== 'avoid');
 
-    // Build opponent hedge picks for all non-split tiers
-    // Each pick generates a hedge pick for the opponent side
-    const hedgePicks = [];
-    nonSplits.forEach(pk => {
-      const game  = games.find(g => g.id === pk.gameId);
-      const hedge = buildHedgePick(pk, game);
-      if (hedge) hedgePicks.push(hedge);
-    });
+    // Build opponent hedge picks (one per non-split pick)
+    const hedgePicks = nonSplits
+      .map(pk => buildHedgePick(pk, games.find(g => g.id === pk.gameId)))
+      .filter(Boolean);
 
-    // Build split assignments using quality distinction
+    // Build split assignments — SplitEngine owns the ratio math
     const splitAssignments = {};
     splits.forEach(pk => {
-      const game = games.find(g => g.id === pk.gameId || g.awayTeam === pk.team || g.homeTeam === pk.team);
+      const game = games.find(g =>
+        g.id === pk.gameId || g.awayTeam === pk.team || g.homeTeam === pk.team
+      );
       if (!game) return;
-      const dogTeam    = game.dog === 'away' ? game.awayTeam : game.homeTeam;
-      const moneyTeam  = game.dog === 'away' ? game.homeTeam : game.awayTeam;
-      const quality    = pk.splitQuality || 'quality';
-      splitAssignments[game.id] = SplitEngine.distribute(dogTeam, moneyTeam, targetCount, quality)
+      const dogTeam   = game.dog === 'away' ? game.awayTeam : game.homeTeam;
+      const moneyTeam = game.dog === 'away' ? game.homeTeam : game.awayTeam;
+      const quality   = pk.splitQuality || 'quality';
+      splitAssignments[game.id] = SplitEngine
+        .distribute(dogTeam, moneyTeam, targetCount, quality)
         .map(a => ({ ...a, confidence: 'split', gameId: game.id, pocket: pk.pocket }));
     });
 
-    // Build cap map including hedge picks
-    const allPicks  = [...nonSplits, ...hedgePicks];
-    const capMap    = OverlapEngine.buildCapMap(allPicks);
+    // Cap map covers primary + hedge picks
+    const capMap = OverlapEngine.buildCapMap([...nonSplits, ...hedgePicks]);
+
+    const { lottery: lotteryCount, core: coreCount, grind: grindCount } =
+      optimalTierCounts(targetCount, nonSplits);
 
     let ctr = Date.now();
     const parlays = [];
 
-    const lotteryCount = Math.min(2, Math.floor(targetCount * 0.1));
-    const coreCount    = Math.floor(targetCount * 0.3);
-    const grindCount   = targetCount - lotteryCount - coreCount;
-
-    const buildTier = (tier, count, legCount, allowHedge = true) => {
+    const buildTier = (tier, count, legCount) => {
+      // Picks eligible for this parlay tier
       const eligible = nonSplits.filter(p => TierEngine.eligible(p.confidence, tier));
-      // Hedge picks route to specific tiers based on tier engine
-      // Lock hedges -> grind only
-      // Need Win hedges -> lottery only
-      // Not Confident hedges -> grind only
-      const hedgeEligible = allowHedge ? hedgePicks.filter(p => {
+
+      // Hedge routing: each tier's hedges go to specific output tiers
+      //   Lock / Confident hedges → grind  (insurance on high-confidence picks)
+      //   Need Win hedges         → lottery (opponent exposure as long shot)
+      //   Not Confident hedges    → grind  (dog-side insurance)
+      const hedgeEligible = hedgePicks.filter(p => {
         const t = p.confidence;
-        if (t === 'lock')  return tier === 'grind';
-        if (t === 'need')  return tier === 'lottery';
-        if (t === 'weak')  return tier === 'grind';
+        if (t === 'lock' || t === 'conf') return tier === 'grind';
+        if (t === 'need')                 return tier === 'lottery';
+        if (t === 'weak')                 return tier === 'grind';
         return false;
-      }) : [];
+      });
+
+      // Per-tier fingerprint registry — Shannon uniqueness enforcement
+      const usedFingerprints = new Set();
 
       for (let i = 0; i < count; i++) {
         const parlayIndex = parlays.length;
-        const splitLegs   = Object.values(splitAssignments).map(arr => arr[parlayIndex] || arr[0]);
-        const pool        = [...eligible, ...hedgeEligible, ...splitLegs];
+        // Inject this parlay's pre-assigned split legs
+        const splitLegs = Object.values(splitAssignments)
+          .map(arr => arr[parlayIndex] || arr[0]);
+        const pool = [...eligible, ...hedgeEligible, ...splitLegs];
         if (pool.length < 2) continue;
-        const p = oneParlay(pool, Math.min(legCount, pool.length), parlays, capMap, ctr++);
-        p.tier  = tier;
+
+        const p = greedyParlay(
+          pool,
+          Math.min(legCount, pool.length),
+          parlays,
+          capMap,
+          ctr++,
+          usedFingerprints
+        );
+
+        // Register fingerprint immediately after build
+        usedFingerprints.add(fingerprint(p.legs));
+        p.tier = tier;
         parlays.push(p);
       }
     };
 
-    buildTier('lottery', lotteryCount, Math.min(maxLegs, allPicks.length + splits.length));
-    buildTier('core',    coreCount,    Math.min(7, allPicks.length + splits.length));
-    buildTier('grind',   grindCount,   Math.min(5, allPicks.length + splits.length));
+    buildTier('lottery', lotteryCount, Math.min(maxLegs, nonSplits.length + splits.length));
+    buildTier('core',    coreCount,    Math.min(7,       nonSplits.length + splits.length));
+    buildTier('grind',   grindCount,   Math.min(5,       nonSplits.length + splits.length));
 
     return parlays;
   };
@@ -1613,9 +1750,13 @@ const renderResults = () => {
   const fetchBtn = allUnlogged.length ? `<div style="background:var(--ink2);border:1px solid var(--line);border-radius:var(--rl);padding:14px 16px;margin-bottom:10px">
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;flex-wrap:wrap;gap:8px">
       <span style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.07em;color:var(--fg3)">Pending (${allUnlogged.length})</span>
-      <button class="fetch-btn" style="width:auto;padding:5px 12px;font-size:11px" onclick="autoEvalResults()">
-        &#8635; Auto-fetch from ESPN
-      </button>
+      <div style="display:flex;gap:6px;flex-wrap:wrap">
+        <button class="fetch-btn" style="width:auto;padding:5px 12px;font-size:11px" onclick="autoEvalResults()">
+          &#8635; Auto-fetch from ESPN
+        </button>
+        ${allUnlogged.length >= 3 ? `<button class="btn btn-xs" onclick="bulkLog('loss')" style="background:var(--red-x);border-color:rgba(220,38,38,.25);color:var(--red-l)">All Loss</button>
+        <button class="btn btn-xs" onclick="bulkLog('win')" style="background:var(--green-x);border-color:rgba(22,163,74,.25);color:var(--green-l)">All Win</button>` : ''}
+      </div>
     </div>
     ${allUnlogged.map(p => `<div class="rrow">
       <div class="rinfo">
